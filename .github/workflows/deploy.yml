@@ -1,0 +1,117 @@
+name: Deploy UDP Gateway to Railway
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ================================================================
+  # JOB 1: LINT & SMOKE TEST
+  # ================================================================
+  test:
+    name: Lint & Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check server.js
+        run: node --check server.js
+
+      - name: Verify package.json start script
+        run: |
+          if ! node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.start ? 0 : 1)"; then
+            echo "❌ package.json tidak punya 'start' script!"
+            exit 1
+          fi
+          echo "✅ start script ditemukan"
+
+      - name: Check required files exist
+        run: |
+          for f in server.js package.json railway.json; do
+            if [ ! -f "$f" ]; then
+              echo "❌ File wajib tidak ditemukan: $f"
+              exit 1
+            fi
+          done
+          echo "✅ Semua file wajib ada"
+
+  # ================================================================
+  # JOB 2: DEPLOY KE RAILWAY (hanya pada push ke main)
+  # ================================================================
+  deploy:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli@latest
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Deploy to Railway
+        run: |
+          echo "🚀 Memulai deployment ke Railway..."
+          railway up \
+            --project="${{ vars.RAILWAY_PROJECT_ID }}" \
+            --environment="production" \
+            --service="${{ vars.RAILWAY_SERVICE_NAME }}" \
+            --detach \
+            --ci
+          echo "✅ Deployment berhasil dikirim ke Railway"
+
+      - name: Wait for deployment to settle
+        run: sleep 30
+
+      - name: Smoke test production endpoint
+        env:
+          HEALTH_URL: ${{ vars.RAILWAY_PUBLIC_URL }}
+        run: |
+          echo "🔍 Menguji health endpoint: $HEALTH_URL/health"
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" "$HEALTH_URL/health" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Health check PASSED (HTTP $HTTP_CODE)"
+              cat /tmp/health.json | head -20
+              exit 0
+            fi
+            echo "⏳ Percobaan $i/5 gagal (HTTP $HTTP_CODE), tunggu 10 detik..."
+            sleep 10
+          done
+          echo "❌ Health check GAGAL setelah 5 percobaan"
+          cat /tmp/health.json 2>/dev/null || true
+          exit 1
